@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -25,11 +26,14 @@ const (
 )
 
 type jfsVolume struct {
-	Name        string
-	Options     map[string]string
-	Source      string
-	Mountpoint  string
-	connections int
+	Name              string
+	Options           map[string]string
+	Source            string
+	Mountpoint        string
+	connections       int
+	healthCheckCtx    context.Context
+	healthCheckCancel context.CancelFunc
+	mu                sync.Mutex
 }
 
 type jfsDriver struct {
@@ -75,16 +79,95 @@ func (d *jfsDriver) saveState() {
 	}
 }
 
+func unescapeMountinfo(s string) string {
+	s = strings.ReplaceAll(s, "\\040", " ")
+	s = strings.ReplaceAll(s, "\\011", "\t")
+	s = strings.ReplaceAll(s, "\\012", "\n")
+	s = strings.ReplaceAll(s, "\\134", "\\")
+	return s
+}
+
+func findMountInfo(mountpoint string) (string, bool, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return "", false, err
+	}
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		sepIdx := -1
+		for i, f := range fields {
+			if f == "-" {
+				sepIdx = i
+				break
+			}
+		}
+		if sepIdx == -1 || len(fields) < sepIdx+3 {
+			continue
+		}
+		mountPath := fields[4]
+		unescaped := unescapeMountinfo(mountPath)
+		if unescaped == mountpoint {
+			fsType := fields[sepIdx+1]
+			return fsType, true, nil
+		}
+	}
+	return "", false, nil
+}
+
+func isFuseMount(mountpoint string) bool {
+	fsType, found, err := findMountInfo(mountpoint)
+	if err != nil || !found {
+		return false
+	}
+	return strings.Contains(fsType, "fuse")
+}
+
+func (v *jfsVolume) startHealthCheck() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.healthCheckCancel != nil {
+		v.healthCheckCancel()
+	}
+	v.healthCheckCtx, v.healthCheckCancel = context.WithCancel(context.Background())
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if !isFuseMount(v.Mountpoint) {
+					logrus.Errorf("FUSE mount at %s is no longer active", v.Mountpoint)
+				}
+			case <-v.healthCheckCtx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (v *jfsVolume) stopHealthCheck() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.healthCheckCancel != nil {
+		v.healthCheckCancel()
+		v.healthCheckCancel = nil
+	}
+}
+
 func ceMount(v *jfsVolume) error {
 	options := map[string]string{}
 	format := exec.Command(ceCliPath, "format", "--no-update")
-	for k, v := range v.Options {
+	for k, vOpt := range v.Options {
 		if k == "env" {
-			format.Env = append(os.Environ(), strings.Split(v, ",")...)
+			format.Env = append(os.Environ(), strings.Split(vOpt, ",")...)
 			logrus.Debugf("modified env: %s", format.Env)
 			continue
 		}
-		options[k] = v
+		options[k] = vOpt
 	}
 	// Raw formatFlags passthrough - passed directly to juicefs format
 	// Example: -o formatFlags="--compress lz4 --trash-days 0"
@@ -158,6 +241,7 @@ func ceMount(v *jfsVolume) error {
 	touch := exec.Command("touch", v.Mountpoint+"/.juicefs")
 	var fileinfo os.FileInfo
 	var err error
+	mounted := false
 	for attempt := 0; attempt < 10; attempt++ {
 		if fileinfo, err = os.Lstat(v.Mountpoint); err == nil {
 			stat, ok := fileinfo.Sys().(*syscall.Stat_t)
@@ -166,26 +250,32 @@ func ceMount(v *jfsVolume) error {
 			}
 			if stat.Ino == 1 {
 				if err = touch.Run(); err == nil {
-					return nil
+					mounted = true
+					break
 				}
 			}
 		}
 		logrus.Debugf("Error in attempt %d: %#v", attempt+1, err)
 		time.Sleep(time.Second)
 	}
-	return logError(err.Error())
+	if !mounted {
+		return logError("failed to verify mount after 10 attempts")
+	}
+
+	v.startHealthCheck()
+	return nil
 }
 
 func eeMount(v *jfsVolume) error {
 	auth := exec.Command(cliPath, "auth", v.Name)
 	options := map[string]string{}
-	for k, v := range v.Options {
+	for k, vOpt := range v.Options {
 		if k == "env" {
-			auth.Env = append(os.Environ(), strings.Split(v, ",")...)
+			auth.Env = append(os.Environ(), strings.Split(vOpt, ",")...)
 			logrus.Debugf("modified env: %s", auth.Env)
 			continue
 		}
-		options[k] = v
+		options[k] = vOpt
 	}
 	// Raw authFlags passthrough - passed directly to juicefs auth
 	// Example: -o authFlags="--token xxx --access-key yyy"
@@ -276,6 +366,7 @@ func eeMount(v *jfsVolume) error {
 			}
 			if stat.Ino == 1 {
 				if err = touch.Run(); err == nil {
+					v.startHealthCheck()
 					return nil
 				}
 			}
@@ -304,6 +395,43 @@ func mountVolume(v *jfsVolume) error {
 		return eeMount(v)
 	}
 	return ceMount(v)
+}
+
+func getCacheDir(v *jfsVolume) string {
+	// Check direct option
+	if dir, ok := v.Options["cache-dir"]; ok && dir != "" {
+		return dir
+	}
+	// Parse mountFlags for --cache-dir
+	if flags, ok := v.Options["mountFlags"]; ok {
+		fields := strings.Fields(flags)
+		for i, f := range fields {
+			if strings.HasPrefix(f, "--cache-dir=") {
+				return strings.TrimPrefix(f, "--cache-dir=")
+			}
+			if f == "--cache-dir" && i+1 < len(fields) {
+				return fields[i+1]
+			}
+		}
+	}
+	// Default
+	return filepath.Join("/var", "jfsCache", v.Name)
+}
+
+func cleanupCache(v *jfsVolume) {
+	cacheDir := getCacheDir(v)
+	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+		return
+	}
+	// Safety check: only remove if the directory name contains the volume name
+	if !strings.Contains(cacheDir, v.Name) {
+		logrus.Warnf("cache directory %s does not contain volume name %s, skipping cleanup", cacheDir, v.Name)
+		return
+	}
+	logrus.Infof("cleaning up cache directory %s", cacheDir)
+	if err := os.RemoveAll(cacheDir); err != nil {
+		logrus.Warnf("failed to clean up cache directory %s: %v", cacheDir, err)
+	}
 }
 
 func umountVolume(v *jfsVolume) error {
@@ -362,7 +490,6 @@ func (d *jfsDriver) Remove(r *volume.RemoveRequest) error {
 	defer d.Unlock()
 
 	v, ok := d.volumes[r.Name]
-
 	if !ok {
 		return logError("volume %s not found", r.Name)
 	}
@@ -371,9 +498,17 @@ func (d *jfsDriver) Remove(r *volume.RemoveRequest) error {
 		return logError("volume %s is in use", r.Name)
 	}
 
-	if err := os.Remove(v.Mountpoint); err != nil && !os.IsNotExist(err) {
-		return logError(err.Error())
+	v.stopHealthCheck()
+
+	// Best effort unmount (always attempt)
+	_ = umountVolume(v)
+
+	// Always use RemoveAll since mountpoint may contain files
+	if err := os.RemoveAll(v.Mountpoint); err != nil {
+		return logError("failed to remove mountpoint %s: %s", v.Mountpoint, err)
 	}
+
+	cleanupCache(v)
 
 	delete(d.volumes, r.Name)
 	d.saveState()
@@ -397,6 +532,9 @@ func (d *jfsDriver) Path(r *volume.PathRequest) (*volume.PathResponse, error) {
 func (d *jfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error) {
 	logrus.WithField("method", "mount").Debugf("%#v", r)
 
+	d.Lock()
+	defer d.Unlock()
+
 	v, ok := d.volumes[r.Name]
 	if !ok {
 		return &volume.MountResponse{}, logError("volume %s not found", r.Name)
@@ -414,6 +552,9 @@ func (d *jfsDriver) Mount(r *volume.MountRequest) (*volume.MountResponse, error)
 func (d *jfsDriver) Unmount(r *volume.UnmountRequest) error {
 	logrus.WithField("method", "umount").Debugf("%#v", r)
 
+	d.Lock()
+	defer d.Unlock()
+
 	v, ok := d.volumes[r.Name]
 	if !ok {
 		return logError("volume %s not found", r.Name)
@@ -423,6 +564,7 @@ func (d *jfsDriver) Unmount(r *volume.UnmountRequest) error {
 		return logError("failed to umount %s: %s", r.Name, err)
 	}
 
+	v.stopHealthCheck()
 	v.connections--
 	return nil
 }
