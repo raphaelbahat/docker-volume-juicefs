@@ -7,6 +7,17 @@
 
 ## Development (full build + install)
 
+The Makefile defaults to `PLUGIN_NAME=juicedata/juicefs` and `PLUGIN_TAG=latest`. For this fork, always override `PLUGIN_NAME`:
+
+```shell
+make PLUGIN_NAME=raphaelbahat/juicefs PLUGIN_TAG=test-fixes
+make enable PLUGIN_NAME=raphaelbahat/juicefs PLUGIN_TAG=test-fixes
+```
+
+`make` builds a rootfs Docker image using the official `Dockerfile` (which includes both CE and EE `juicefs` binaries at the correct paths), exports it, and calls `docker plugin create`. `make enable` enables that plugin. This is the canonical workflow for a clean-slate test.
+
+### Using Vagrant
+
 Boot up vagrant environment:
 
 ```shell
@@ -21,13 +32,15 @@ export WORKDIR=~/go/src/docker-volume-juicefs
 mkdir -p $WORKDIR
 rsync -avz --exclude plugin --exclude .git --exclude .vagrant /vagrant/ $WORKDIR/
 cd $WORKDIR
-make
-make enable
-docker volume create -d juicedata/juicefs:next -o name=$JFS_VOL -o token=$JFS_TOKEN -o access-key=$JFS_ACCESSKEY -o secret-key=$JFS_SECRETKEY jfsvolume
+make PLUGIN_NAME=raphaelbahat/juicefs PLUGIN_TAG=test-fixes
+make enable PLUGIN_NAME=raphaelbahat/juicefs PLUGIN_TAG=test-fixes
+docker volume create -d raphaelbahat/juicefs:test-fixes -o name=$JFS_VOL -o metaurl=$JFS_META_URL jfsvolume
 docker run -it -v jfsvolume:/opt busybox ls /opt
 ```
 
-`make` builds a rootfs Docker image, exports it, and calls `docker plugin create` with tag `juicedata/juicefs:next`. `make enable` enables that plugin. This is the canonical workflow for a clean-slate test.
+### IMPORTANT: Always use the official Dockerfile
+
+The `Dockerfile` in this repo places `juicefs` CE at `/bin/juicefs` and `juicefs` EE at `/usr/bin/juicefs` — these paths must match the `ceCliPath` and `cliPath` constants in `main.go`. **Never create a custom Dockerfile or base image** (e.g. `python:3.12-slim-bookworm`) for the plugin rootfs, as this will place binaries at wrong paths and cause `No help topic for 'format'` errors.
 
 ## Debug (hot-swap binary — preferred for iteration)
 
@@ -46,36 +59,36 @@ The binary **must** be statically linked (musl) because the plugin rootfs has no
 1. Find the plugin's filesystem path:
 
 ```shell
-docker plugin inspect juicefs:latest --format '{{.Id}}'
+docker plugin inspect raphaelbahat/juicefs:test-fixes --format '{{.Id}}'
 ```
 
 2. Disable the plugin (all volumes using it must be removed or unmounted first):
 
 ```shell
-docker plugin disable juicefs:latest
+docker plugin disable raphaelbahat/juicefs:test-fixes
 ```
 
 3. Replace the binary:
 
 ```shell
-PLUGIN_ID=$(docker plugin inspect juicefs:latest --format '{{.Id}}')
+PLUGIN_ID=$(docker plugin inspect raphaelbahat/juicefs:test-fixes --format '{{.Id}}')
 sudo cp bin/docker-volume-juicefs /var/lib/docker/plugins/${PLUGIN_ID}/rootfs/docker-volume-juicefs
 ```
 
 4. Re-enable:
 
 ```shell
-docker plugin enable juicefs:latest
+docker plugin enable raphaelbahat/juicefs:test-fixes
 ```
 
 ### Verify the plugin is responsive
 
 ```shell
-# Quick check — should return JSON with VolumeDriver
+# Quick check — should list volumes without error
 docker volume ls
 
 # Direct socket test
-PLUGIN_ID=$(docker plugin inspect juicefs:latest --format '{{.Id}}')
+PLUGIN_ID=$(docker plugin inspect raphaelbahat/juicefs:test-fixes --format '{{.Id}}')
 sudo python3 -c "
 import socket
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -91,9 +104,9 @@ If you see `{"Implements": ["VolumeDriver"]}`, the plugin is healthy. If you get
 ### Enable debug logging
 
 ```shell
-docker plugin disable juicefs:latest
-docker plugin set juicefs:latest DEBUG=1
-docker plugin enable juicefs:latest
+docker plugin disable raphaelbahat/juicefs:test-fixes
+docker plugin set raphaelbahat/juicefs:test-fixes DEBUG=1
+docker plugin enable raphaelbahat/juicefs:test-fixes
 ```
 
 ## Viewing plugin logs
@@ -101,13 +114,14 @@ docker plugin enable juicefs:latest
 The plugin's stdout/stderr are redirected to the Docker daemon log. Entries have a `plugin=<ID>` suffix.
 
 ```shell
-# Via journalctl
-journalctl -u docker.service -f
+# Via journalctl — filter by plugin ID
+PLUGIN_ID=$(docker plugin inspect raphaelbahat/juicefs:test-fixes --format '{{.Id}}')
+journalctl -u docker.service -f | grep "plugin=${PLUGIN_ID}"
 
 # Via runc — find the plugin container ID first
-sudo runc --root /run/docker/plugins/runtime-root/plugins.moby list
+sudo runc --root /run/docker/runtime-runc/plugins.moby list
 # Then exec into it to read the JuiceFS log:
-sudo runc --root /run/docker/plugins/runtime-root/plugins.moby exec <CONTAINER_ID> cat /var/log/juicefs.log
+sudo runc --root /run/docker/runtime-runc/plugins.moby exec <CONTAINER_ID> cat /var/log/juicefs.log
 ```
 
 NOTE: the runtime root directory could be `moby-plugins` instead of `plugins.moby` in some Docker versions.
@@ -120,7 +134,7 @@ This error means Docker cannot reach the plugin's Unix socket. Check in order:
 2. Does the socket file exist? `sudo ls /run/docker/plugins/<ID>/`
 3. Is the process running? `ps aux | grep docker-volume-juicefs`
 4. Is the process listening? Try the direct socket test above.
-5. If the process is running but the socket is stale (file exists but `connection refused`), the plugin was likely installed via `docker plugin create` or `docker plugin install` from a pushed image — **this is the known bug**. Fix by disabling, hot-swapping the binary, and re-enabling.
+5. If the process is running but the socket is stale (file exists but `connection refused`), the plugin was likely installed via `docker plugin install` from a pushed Docker Hub image — **this is the known bug**. Fix by using `make PLUGIN_NAME=raphaelbahat/juicefs PLUGIN_TAG=test-fixes` to rebuild properly, or by disabling, hot-swapping the binary, and re-enabling.
 
 ## Plugin build must use musl static linking
 
