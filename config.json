@@ -41,6 +41,15 @@
                 "source"
             ],
             "type": "bind"
+        },
+        {
+            "Description": "JuiceFS cache directory",
+            "Destination": "/var/jfsCache",
+            "Name": "cache",
+            "Options": ["rbind", "rw"],
+            "Settable": ["Source"],
+            "Source": "/var/lib/juicefs-cache",
+            "Type": "bind"
         }
     ],
     "network": {

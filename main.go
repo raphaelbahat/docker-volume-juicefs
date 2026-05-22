@@ -508,7 +508,9 @@ func (d *jfsDriver) Remove(r *volume.RemoveRequest) error {
 		return logError("failed to remove mountpoint %s: %s", v.Mountpoint, err)
 	}
 
-	cleanupCache(v)
+	if v.CleanupCache {
+		cleanupCache(v)
+	}
 
 	delete(d.volumes, r.Name)
 	d.saveState()
