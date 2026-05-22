@@ -1,59 +1,56 @@
 {
-    "description": "JuiceFS plugin for Docker",
-    "documentation": "https://github.com/juicedata/docker-volume-juicefs",
-    "entrypoint": [
+    "Description": "JuiceFS plugin for Docker",
+    "Documentation": "https://github.com/juicedata/docker-volume-juicefs",
+    "Entrypoint": [
         "/docker-volume-juicefs"
     ],
-    "env": [
+    "Env": [
         {
-            "name": "DEBUG",
-            "settable": [
+            "Name": "DEBUG",
+            "Settable": [
                 "value"
             ],
-            "value": "0"
+            "Value": "0"
         }
     ],
-    "interface": {
-        "socket": "jfs.sock",
-        "types": [
+    "Interface": {
+        "Socket": "jfs.sock",
+        "Types": [
             "docker.volumedriver/1.0"
         ]
     },
-    "linux": {
-        "capabilities": [
+    "Linux": {
+        "Capabilities": [
             "CAP_SYS_ADMIN"
         ],
-        "devices": [
+        "Devices": [
             {
-                "path": "/dev/fuse"
+                "Path": "/dev/fuse"
             }
         ]
     },
-    "mount": [
+    "Mounts": [
         {
-            "destination": "/jfs/state",
-            "options": [
-                "rbind"
-            ],
-            "name": "state",
-            "source": "/var/lib/docker/plugins/",
-            "settable": [
-                "source"
-            ],
-            "type": "bind"
+            "Description": "Plugin state directory",
+            "Destination": "/jfs/state",
+            "Name": "state",
+            "Options": ["rbind"],
+            "Settable": ["source"],
+            "Source": "/var/lib/docker/plugins/",
+            "Type": "bind"
         },
         {
             "Description": "JuiceFS cache directory",
             "Destination": "/var/jfsCache",
             "Name": "cache",
             "Options": ["rbind", "rw"],
-            "Settable": ["Source"],
+            "Settable": ["source"],
             "Source": "/var/lib/juicefs-cache",
             "Type": "bind"
         }
     ],
-    "network": {
-        "type": "host"
+    "Network": {
+        "Type": "host"
     },
-    "propagatedmount": "/jfs/volumes"
+    "PropagatedMount": "/jfs/volumes"
 }
