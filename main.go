@@ -30,6 +30,7 @@ type jfsVolume struct {
 	Options           map[string]string
 	Source            string
 	Mountpoint        string
+	CleanupCache      bool
 	connections       int
 	healthCheckCtx    context.Context
 	healthCheckCancel context.CancelFunc
@@ -345,6 +346,10 @@ func eeMount(v *jfsVolume) error {
 		}
 		mount.Args = append(mount.Args, fmt.Sprintf("--%s", mountFlag))
 		delete(options, mountFlag)
+	}
+	if val, ok := options["cleanup-cache"]; ok {
+		v.CleanupCache, _ = strconv.ParseBool(val)
+		delete(options, "cleanup-cache")
 	}
 	for mountOption, val := range options {
 		mount.Args = append(mount.Args, fmt.Sprintf("--%s=%s", mountOption, val))
